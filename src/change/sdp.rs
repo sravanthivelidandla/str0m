@@ -355,6 +355,30 @@ impl<'a> SdpApi<'a> {
         }
     }
 
+    /// Stop an already existing media.
+    ///
+    /// The next generated offer emits the m-line with port 0 and excludes
+    /// it from the BUNDLE group, per [RFC 8843] §7.5.3. The remote
+    /// transceiver transitions to the "stopped" state and the m-line slot
+    /// becomes eligible for recycling.
+    ///
+    /// Unlike [`SdpApi::set_direction()`] with [`Direction::Inactive`],
+    /// a stopped m-line cannot be reactivated.
+    ///
+    /// If the media doesn't exist, or is already stopped, [`SdpApi::apply()`]
+    /// will not require a negotiation.
+    ///
+    /// [RFC 8843]: https://datatracker.ietf.org/doc/html/rfc8843#section-7.5.3
+    pub fn stop_media(&mut self, mid: Mid) {
+        let changed = self.rtc.session.stop_media(mid);
+
+        if changed {
+            self.changes
+                .0
+                .push(Change::Direction(mid, Direction::Inactive));
+        }
+    }
+
     /// Add a new reliable ordered data channel and get the `id` that will be used.
     ///
     /// Use `add_channel_with_config` when unreliable or unordered data channels are preferred.
@@ -918,7 +942,7 @@ fn apply_offer(session: &mut Session, offer: SdpOffer) -> Result<(), RtcError> {
     update_session(session, &offer);
 
     let bundle_mids = offer.bundle_mids();
-    let new_lines = sync_medias(session, &offer).map_err(RtcError::RemoteSdp)?;
+    let new_lines = sync_medias(session, &offer, true).map_err(RtcError::RemoteSdp)?;
 
     add_new_lines(session, &new_lines, true, bundle_mids).map_err(RtcError::RemoteSdp)?;
 
@@ -937,7 +961,7 @@ fn apply_answer(
     update_session(session, &answer);
 
     let bundle_mids = answer.bundle_mids();
-    let new_lines = sync_medias(session, &answer).map_err(RtcError::RemoteSdp)?;
+    let new_lines = sync_medias(session, &answer, false).map_err(RtcError::RemoteSdp)?;
 
     // The new_lines from the answer must correspond to what we sent in the offer.
     if let Some(err) = pending.ensure_correct_answer(&new_lines) {
@@ -1054,8 +1078,15 @@ fn add_pending_changes(session: &mut Session, pending: Changes) {
 /// Compares m-lines in Sdp with that already in the session.
 ///
 /// * Existing m-lines can apply changes (such as direction change).
-/// * New m-lines are returned to the caller.
-fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaLine>, String> {
+/// * New m-lines are returned to the caller paired with the session
+///   index they should occupy. The index is normally the next free slot,
+///   but can be a recycled slot (RFC 8829 §5.2.2) when the remote has
+///   replaced a previously disabled Media with a new mid.
+fn sync_medias<'a>(
+    session: &mut Session,
+    sdp: &'a Sdp,
+    is_offer: bool,
+) -> Result<Vec<(usize, &'a MediaLine)>, String> {
     let mut new_lines = Vec::with_capacity(sdp.media_lines.len());
     let bundle_mids = sdp.bundle_mids();
 
@@ -1087,6 +1118,25 @@ fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaL
 
                     continue;
                 }
+
+                // Unknown mid at an index held by a disabled Media means
+                // the remote has recycled the slot (RFC 8829 §5.2.2).
+                // Recycling is only permitted in offers; an answer that
+                // rewires a mid at a stopped slot is malformed.
+                if let Some(pos) = session.medias.iter().position(|l| l.index() == idx) {
+                    if !is_offer {
+                        return Err(format!(
+                            "Answer recycles stopped m-line (not permitted per RFC 8829 §5.2.2): {}",
+                            m.mid()
+                        ));
+                    }
+                    if !session.medias[pos].disabled() {
+                        return index_err(m.mid());
+                    }
+                    let retired_mid = session.medias[pos].mid();
+                    session.medias.swap_remove(pos);
+                    session.streams.remove_streams_by_mid(retired_mid);
+                }
             }
             _ => {
                 continue;
@@ -1094,7 +1144,7 @@ fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaL
         }
 
         // Second, discover new m-lines.
-        new_lines.push(m);
+        new_lines.push((idx, m));
     }
 
     fn index_err<T>(mid: Mid) -> Result<T, String> {
@@ -1105,14 +1155,17 @@ fn sync_medias<'a>(session: &mut Session, sdp: &'a Sdp) -> Result<Vec<&'a MediaL
 }
 
 /// Adds new m-lines as found in an offer or answer.
+///
+/// Each entry in `new_lines` pairs an m-line with the session index it
+/// should occupy.
 fn add_new_lines(
     session: &mut Session,
-    new_lines: &[&MediaLine],
+    new_lines: &[(usize, &MediaLine)],
     is_offer: bool,
     bundle_mids: Option<&[Mid]>,
 ) -> Result<(), String> {
-    for m in new_lines {
-        let idx = session.line_count();
+    for (idx, m) in new_lines {
+        let idx = *idx;
 
         if m.typ.is_media() {
             let mut media = Media::from_remote_media_line(m, idx, is_offer);
@@ -1219,7 +1272,7 @@ fn update_media(
                 media.mid()
             );
         }
-        media.mark_disabled();
+        media.mark_stopped();
         media.set_direction(Direction::Inactive);
         return;
     }
@@ -1551,15 +1604,26 @@ impl<'a, 'b> AsSdpParams<'a, 'b> {
             )
         };
 
+        // RFC 8842 Section 5.2/5.5: Offerers MUST always use a=setup:actpass.
+        // Answerers use the negotiated role (active/passive).
+        // We distinguish offer vs answer by the presence of `pending` (Some = offer).
+        let setup = if pending.is_some() {
+            // This is an offer — always actpass per RFC 8842
+            Setup::ActPass
+        } else {
+            // This is an answer — use the negotiated DTLS role
+            match rtc.dtls.is_active() {
+                Some(true) => Setup::Active,
+                Some(false) => Setup::Passive,
+                None => Setup::ActPass,
+            }
+        };
+
         AsSdpParams {
             candidates,
             creds,
             fingerprint: rtc.dtls.local_fingerprint(),
-            setup: match rtc.dtls.is_active() {
-                Some(true) => Setup::Active,
-                Some(false) => Setup::Passive,
-                None => Setup::ActPass,
-            },
+            setup,
             pending,
             local_sctp_init: rtc.sctp.local_sctp_init_for_sdp(),
         }
@@ -1622,7 +1686,7 @@ impl Changes {
     }
 
     /// Tests the given lines (from answer) corresponds to changes.
-    fn ensure_correct_answer(&self, lines: &[&MediaLine]) -> Option<String> {
+    fn ensure_correct_answer(&self, lines: &[(usize, &MediaLine)]) -> Option<String> {
         if self.count_new_medias() != lines.len() {
             return Some(format!(
                 "Differing m-line count in offer vs answer: {} != {}",
@@ -1631,7 +1695,7 @@ impl Changes {
             ));
         }
 
-        'next: for l in lines {
+        'next: for (_, l) in lines {
             let mid = l.mid();
 
             for m in &self.0 {
@@ -1775,6 +1839,82 @@ mod test {
 
     fn count_lines(lines: &str, what: &str) -> usize {
         lines.lines().filter(|l| l == &what).count()
+    }
+
+    fn get_setup_from_media_line(line: &MediaLine) -> Setup {
+        line.setup().expect("Expected a=setup attribute in SDP")
+    }
+
+    /// RFC 8842 §5.2: an offer MUST use a=setup:actpass regardless of DTLS role.
+    #[test]
+    fn offer_uses_actpass() {
+        crate::init_crypto_default();
+
+        let now = Instant::now();
+        let mut rtc = Rtc::new(now);
+
+        let mut change = rtc.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, _pending) = change.apply().unwrap();
+
+        let setup = get_setup_from_media_line(&offer.media_lines[0]);
+        assert_eq!(
+            setup,
+            Setup::ActPass,
+            "Offer must use a=setup:actpass per RFC 8842 §5.2"
+        );
+    }
+
+    /// RFC 8842 §5.5: the answerer uses the negotiated DTLS role (active or passive).
+    /// When the offerer uses actpass, the answerer picks passive (DTLS server) and the
+    /// offerer becomes active (DTLS client). The answerer's SDP must reflect passive.
+    #[test]
+    fn answer_uses_negotiated_dtls_role() {
+        crate::init_crypto_default();
+
+        let now = Instant::now();
+        let mut offerer = Rtc::new(now);
+        let mut answerer = Rtc::new(now);
+
+        // Offerer creates the offer.
+        let mut change = offerer.sdp_api();
+        change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+        let (offer, pending) = change.apply().unwrap();
+
+        // Verify the offer itself is actpass.
+        assert_eq!(
+            get_setup_from_media_line(&offer.media_lines[0]),
+            Setup::ActPass,
+            "Offer must use a=setup:actpass"
+        );
+
+        // Answerer accepts and generates the answer.
+        let answer = answerer.sdp_api().accept_offer(offer).unwrap();
+
+        // When the offerer sends actpass, the answerer takes the passive DTLS role
+        // (see init_dtls: ActPass from remote → local takes Passive).
+        // The answerer's SDP must reflect that with a=setup:passive.
+        assert_eq!(
+            get_setup_from_media_line(&answer.media_lines[0]),
+            Setup::Passive,
+            "Answerer's SDP must use a=setup:passive when responding to an actpass offer"
+        );
+
+        // Complete the exchange on the offerer side.
+        offerer.sdp_api().accept_answer(pending, answer).unwrap();
+
+        // Now generate a subsequent offer from the offerer (re-offer).
+        // Even after the DTLS role is settled (offerer is now passive), a new offer
+        // must still carry a=setup:actpass per RFC 8842 §5.2.
+        let mut change = offerer.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
+        let (reoffer, _) = change.apply().unwrap();
+
+        assert_eq!(
+            get_setup_from_media_line(&reoffer.media_lines[0]),
+            Setup::ActPass,
+            "Re-offer must still use a=setup:actpass even after DTLS role is settled"
+        );
     }
 
     #[test]

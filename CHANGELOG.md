@@ -1,6 +1,28 @@
 # Unreleased
 
+  * Add stereo to opus format params #955
+
+# 0.19.0
+
+  * Expose H265 some already referenced profile structs #948
+  * Update to dimpl 0.6.1
+  * Update openssl to 0.10.78
+
+# is-0.9.0
+
+  * IceCandidate expose str0m/is-unique local property #951
+  * Implement ICE role conflict resolution #950
+
+# 0.18.1
+
+  * dtls: fix to resends during handshake #943
+  * Add `SdpApi::stop_media()` to stop an existing m-line #941
+  * Update chat example to use `SdpApi::stop_media()` when clients are removed #941
+  * Accept recycled m-line indexes when the previous m-line was stopped #941
+  * Always use ActPass when sending an SDP offer (RFC 8842 Section 5.2/5.5) #893
+  * Fix frame drops in Firefox due missing RTX SSRC #940
   * Drop stale depacketizer state on stream pause and restore paused timestamp repair #929
+  * Reduce bounds checks in STUN encode/decode #931
 
 # 0.18.0
 
